@@ -6,10 +6,11 @@ use std::{
     io::{Read as _, Seek as _, Write as _},
     num::NonZeroUsize,
     path::PathBuf,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use rusqlite::{params, Connection, Result}; // SQLite-Bibliothek
 
 use crate::configure::StatsOpt;
 
@@ -22,6 +23,7 @@ pub struct StatsRecorder {
     pub nnue_nps: NpsRecorder,
     store: Option<(PathBuf, File)>,
     cores: NonZeroUsize,
+    db_conn: Option<Connection>, // SQLite-Verbindung
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -68,48 +70,54 @@ impl StatsRecorder {
                 store: None,
                 nnue_nps,
                 cores,
+                db_conn: None,
             };
         }
 
-        let path = if let Some(path) = opt.stats_file.or_else(default_stats_file) {
-            path
-        } else {
-            eprintln!("E: Could not resolve ~/.fishnet-stats");
-            return StatsRecorder {
-                stats: Stats::default(),
-                store: None,
-                nnue_nps,
-                cores,
-            };
+        let path = opt.stats_file.or_else(default_stats_file);
+
+        let (stats, store) = match &path {
+            Some(path) => match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+            {
+                Ok(mut file) => (
+                    match Stats::load_from(&mut file) {
+                        Ok(Some(stats)) => {
+                            println!("Resuming from {path:?} ...");
+                            stats
+                        }
+                        Ok(None) => {
+                            println!("Recording to new stats file {path:?} ...");
+                            Stats::default()
+                        }
+                        Err(err) => {
+                            eprintln!("E: Failed to resume from {path:?}: {err}. Resetting ...");
+                            Stats::default()
+                        }
+                    },
+                    Some((path.clone(), file)),
+                ),
+                Err(err) => {
+                    eprintln!("E: Failed to open {path:?}: {err}");
+                    (Stats::default(), None)
+                }
+            },
+            None => {
+                eprintln!("E: Could not resolve ~/.fishnet-stats");
+                (Stats::default(), None)
+            }
         };
 
-        let (stats, store) = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-        {
-            Ok(mut file) => (
-                match Stats::load_from(&mut file) {
-                    Ok(Some(stats)) => {
-                        println!("Resuming from {path:?} ...");
-                        stats
-                    }
-                    Ok(None) => {
-                        println!("Recording to new stats file {path:?} ...");
-                        Stats::default()
-                    }
-                    Err(err) => {
-                        eprintln!("E: Failed to resume from {path:?}: {err}. Resetting ...");
-                        Stats::default()
-                    }
-                },
-                Some((path, file)),
-            ),
+        // SQLite-Datenbank initialisieren
+        let db_conn = match initialize_database("stats.db") {
+            Ok(conn) => Some(conn),
             Err(err) => {
-                eprintln!("E: Failed to open {path:?}: {err}");
-                (Stats::default(), None)
+                eprintln!("E: Failed to initialize SQLite database: {err}");
+                None
             }
         };
 
@@ -118,6 +126,7 @@ impl StatsRecorder {
             store,
             nnue_nps,
             cores,
+            db_conn,
         }
     }
 
@@ -130,26 +139,58 @@ impl StatsRecorder {
             self.nnue_nps.record(nnue_nps);
         }
 
-        if let Some((ref path, ref mut stats_file)) = self.store {
+        // Speichern in .stats-file
+        if let Some((ref path, ref mut stats_file)) = &self.store {
             if let Err(err) = self.stats.save_to(stats_file) {
                 eprintln!("E: Failed to write stats to {path:?}: {err}");
             }
         }
+
+        // Speichern in SQLite-Datenbank
+        if let Some(conn) = &self.db_conn {
+            if let Err(err) = self.save_to_database(conn, nnue_nps) {
+                eprintln!("E: Failed to save stats to SQLite database: {err}");
+            }
+        }
     }
 
-    pub fn min_user_backlog(&self) -> Duration {
-        // Estimate how long this client would take for the next batch of
-        // 60 positions at 1_450_000 nodes each.
-        let estimated_batch_seconds = u64::from(min(
-            7 * 60, // deadline
-            60 * 1_450_000 / self.cores.get() as u32 / max(1, self.nnue_nps.nps),
-        ));
+    // Neue Methode: Stats in SQLite speichern
+    pub fn save_to_database(&self, conn: &Connection, nnue_nps: Option<u32>) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
 
-        // Top end clients take no longer than 35 seconds. Its worth joining if
-        // estimated time < top client time on empty queue + queue wait time.
-        let top_batch_seconds = 35;
-        Duration::from_secs(estimated_batch_seconds.saturating_sub(top_batch_seconds))
+        conn.execute(
+            "INSERT INTO stats (timestamp, total_batches, total_positions, total_nodes, nnue_nps)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now as i64,
+                self.stats.total_batches as i64,
+                self.stats.total_positions as i64,
+                self.stats.total_nodes as i64,
+                nnue_nps.unwrap_or_default() as i64, // nnue_nps, falls vorhanden
+            ],
+        )?;
+        Ok(())
     }
+}
+
+// Funktion, um die SQLite-Datenbank zu initialisieren
+fn initialize_database(path: &str) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            total_batches INTEGER NOT NULL,
+            total_positions INTEGER NOT NULL,
+            total_nodes INTEGER NOT NULL,
+            nnue_nps INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    Ok(conn)
 }
 
 #[derive(Clone)]
